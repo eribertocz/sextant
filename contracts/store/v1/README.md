@@ -26,8 +26,8 @@ How every other module reads and writes analytical data in the lake (DuckLake), 
 | `type` | Tables |
 |---|---|
 | `parquet`, `csv` | one table `<name>.data`: every file matching `path` (a glob is allowed), columns united by name, types inferred by DuckDB, never as floating point unless the source holds floating point (law 11, #252):
-  - **CSV:** inference uses only `BOOLEAN`, `BIGINT`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ` and `VARCHAR`. A decimal column, or an integer beyond `BIGINT`, arrives as its exact text, and the model casts it (`CAST(amount AS DECIMAL(14, 2))`).
-  - **Parquet:** a column whose `DECIMAL` is wider than 38 digits in any matched file cannot be read: reading it fails with a message naming `UNSUPPORTED_SOURCE_TYPE`, the source and the column. The other columns stay readable.
+  - **CSV:** inference uses only `BOOLEAN`, `BIGINT`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ` and `VARCHAR`, and reads every row of every file, not a sample. A decimal column, or an integer beyond `BIGINT`, arrives as its exact text, and the model casts it (`CAST(amount AS DECIMAL(14, 2))`).
+  - **Parquet:** some top-level columns hold, at any depth (directly, or in a struct field, list element or map key or value), a `DECIMAL` wider than 38 digits in any matched file. Such a column cannot be read: reading it fails with a message naming `UNSUPPORTED_SOURCE_TYPE`, the source and the column. The other columns stay readable. Schemas are read from each file's footer, under both of Parquet's decimal annotations.
 
   A matched file whose name has `*`, `?` or `[` is `STORE_SOURCE_INVALID` (`details.file`): DuckDB's readers would expand it again and read another file (#82) |
 | `duckdb` | the file attached `READ_ONLY`: `<name>.<schema>.<table>`, and `<name>.<table>` for schema `main` |

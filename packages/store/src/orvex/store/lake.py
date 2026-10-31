@@ -36,6 +36,7 @@ from typing import Any, NamedTuple
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 from orvex.contracts.store.v1 import (
     AzureStorage,
     CommitResult,
@@ -1702,13 +1703,15 @@ class Lake:
             listed = ", ".join(_quote(str(file)) for file in matched_files)
             if source.type == "parquet":
                 reader = f"read_parquet([{listed}], union_by_name = true)"
-                replaced = _wide_decimals(builder, source.name, listed)
+                replaced = _wide_decimals(source.name, [str(file) for file in matched_files])
             else:
                 # Detection never yields floating point: decimal text stays exact text, and the
                 # model casts it explicitly (law 11). A DECIMAL(38,9) candidate would round
                 # longer fractions silently (measured on 2.0.0).
+                # The whole file is sniffed (`sample_size = -1`): with a sample, a decimal after
+                # it would be rounded into an integer column inferred from the sample.
                 reader = (
-                    f"read_csv([{listed}], union_by_name = true, "
+                    f"read_csv([{listed}], union_by_name = true, sample_size = -1, "
                     f"auto_type_candidates = {_CSV_TYPE_CANDIDATES})"
                 )
                 replaced = ""
@@ -3084,28 +3087,58 @@ def _utc_schema(schema: pa.Schema) -> pa.Schema:
 _CSV_TYPE_CANDIDATES = "['BOOLEAN', 'BIGINT', 'DATE', 'TIMESTAMP', 'TIMESTAMPTZ', 'VARCHAR']"
 
 
-def _wide_decimals(connection: duckdb.DuckDBPyConnection, source: str, listed: str) -> str:
-    """` REPLACE (…)` for every Parquet column, in any listed file, that is a DECIMAL wider
-    than 38 digits: DuckDB reads such a column as DOUBLE, so reading it fails instead (law 11).
-    Queries that do not read it are unaffected. "" when there is none."""
-    result = connection.execute(
-        "SELECT list(DISTINCT [name, CAST(precision AS VARCHAR)] ORDER BY [name, "
-        f"CAST(precision AS VARCHAR)]) FROM parquet_schema([{listed}]) "
-        "WHERE converted_type = 'DECIMAL' AND precision > 38"
-    )
-    row = result.fetchone()  # one metadata row: the wide columns as a list
-    result.fetchone()  # reaches the end of the result, so the connection is free for the view
-    columns = row[0] if row and row[0] else []
-    if not columns:
+def _wide_decimals(source: str, files: Sequence[str]) -> str:
+    """` REPLACE (…)` for every top-level Parquet column that holds, at any depth (struct
+    field, list element, map key or value), a DECIMAL wider than 38 digits in any of `files`:
+    DuckDB reads such a value as DOUBLE, so reading the column fails instead (law 11). Queries
+    that do not read it are unaffected. "" when there is none.
+
+    The schemas are read with pyarrow from each file's footer (metadata only, no rows). It
+    resolves both Parquet's converted and logical decimal annotations."""
+    widest: dict[str, tuple[str, int]] = {}
+    for file in files:
+        try:
+            schema = pq.read_schema(file)
+        except (OSError, pa.ArrowException) as error:
+            raise StoreError(
+                "STORE_SOURCE_INVALID",
+                f"Source {source} cannot be read as parquet.",
+                {"source": source, "file": file, "duckdb": str(error)},
+            ) from None
+        for field in schema:
+            digits = _widest_decimal(field.type)
+            key = field.name.lower()
+            if digits > 38 and digits > widest.get(key, ("", 0))[1]:
+                widest[key] = (field.name, digits)
+    if not widest:
         return ""
     parts = []
-    for name, digits in columns:
+    for name, digits in sorted(widest.values()):
         message = (
-            f"UNSUPPORTED_SOURCE_TYPE: column {name} of source {source} is a DECIMAL with "
+            f"UNSUPPORTED_SOURCE_TYPE: column {name} of source {source} holds a DECIMAL with "
             f"{digits} digits, which cannot be read exactly."
         )
-        parts.append(f"error({_quote(message)}) AS {_identifier(str(name))}")
+        parts.append(f"error({_quote(message)}) AS {_identifier(name)}")
     return f" REPLACE ({', '.join(parts)})"
+
+
+def _widest_decimal(kind: pa.DataType) -> int:
+    """The largest DECIMAL precision anywhere inside an Arrow type (0 when there is none)."""
+    if pa.types.is_decimal(kind):
+        return int(kind.precision)
+    if pa.types.is_struct(kind):
+        return max((_widest_decimal(kind.field(i).type) for i in range(kind.num_fields)), default=0)
+    if pa.types.is_map(kind):
+        return max(_widest_decimal(kind.key_type), _widest_decimal(kind.item_type))
+    if (
+        pa.types.is_list(kind)
+        or pa.types.is_large_list(kind)
+        or pa.types.is_fixed_size_list(kind)
+        or pa.types.is_list_view(kind)
+        or pa.types.is_large_list_view(kind)
+    ):
+        return _widest_decimal(kind.value_type)
+    return 0
 
 
 class Inexact(NamedTuple):

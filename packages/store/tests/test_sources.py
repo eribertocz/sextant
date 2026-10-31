@@ -425,3 +425,77 @@ def test_a_parquet_decimal_wider_than_38_digits_is_refused_not_rounded(
         assert "ledger" in text
     finally:
         lake.close()
+
+
+def test_a_csv_decimal_after_the_detection_sample_stays_exact_text(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #253 Reviewer pass 1: with a sample, a later 1.5 was rounded into an integer column.
+    folder = tmp_path_factory.mktemp("csv-late")
+    lines = ["id,amount", *(f"{i},{i}" for i in range(30000)), "30000,1.5", "30001,1e3"]
+    (folder / "late.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    lake = open_lake(location, LIMITS, [source("late", "csv", folder / "late.csv")])
+    try:
+        write(
+            lake,
+            "CREATE TABLE tail AS SELECT id, typeof(amount) AS kind, amount "
+            "FROM late.data WHERE id >= 30000",
+        )
+        assert read(lake, "SELECT kind, amount FROM tail ORDER BY id") == [
+            {"kind": "VARCHAR", "amount": "1.5"},
+            {"kind": "VARCHAR", "amount": "1e3"},
+        ]
+    finally:
+        lake.close()
+
+
+def test_wide_decimals_nested_or_in_several_files_refuse_only_their_column(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #253 Reviewer pass 1: a wide decimal inside a struct, a list or a map, and one whose
+    # precision differs between files, fail when read; the other columns stay readable.
+    folder = tmp_path_factory.mktemp("wide-nested")
+    one = decimal.Decimal("1.10")
+    pq.write_table(
+        pa.table(
+            {
+                "amount": pa.array([one], pa.decimal128(10, 2)),
+                "nested": pa.array(
+                    [{"amount": one}], pa.struct([("amount", pa.decimal256(50, 2))])
+                ),
+                "listed": pa.array([[one]], pa.list_(pa.decimal256(50, 2))),
+                "mapped": pa.array([[("a", one)]], pa.map_(pa.string(), pa.decimal256(45, 2))),
+                "w": pa.array([one], pa.decimal256(45, 2)),
+                "edge": pa.array([decimal.Decimal("1.10")], pa.decimal128(38, 2)),
+            }
+        ),
+        folder / "a.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "amount": pa.array([one], pa.decimal128(10, 2)),
+                "w": pa.array([one], pa.decimal256(50, 2)),
+            }
+        ),
+        folder / "b.parquet",
+    )
+    lake = open_lake(location, LIMITS, [source("deep", "parquet", folder / "*.parquet")])
+    try:
+        write(
+            lake,
+            "CREATE TABLE fine AS SELECT CAST(amount AS VARCHAR) AS amount, "
+            "typeof(edge) AS edge_kind FROM deep.data",
+        )
+        assert read(lake, "SELECT amount, edge_kind FROM fine") == [
+            {"amount": "1.10", "edge_kind": "DECIMAL(38,2)"},
+            {"amount": "1.10", "edge_kind": "DECIMAL(38,2)"},
+        ]
+        for column in ("nested", "listed", "mapped", "w"):
+            with pytest.raises(StoreError) as caught:
+                write(lake, f"CREATE TABLE copy_{column} AS SELECT {column} FROM deep.data")
+            text = f"{caught.value} {caught.value.details}"
+            assert "UNSUPPORTED_SOURCE_TYPE" in text
+            assert f"column {column} " in text
+    finally:
+        lake.close()
