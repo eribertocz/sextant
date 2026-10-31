@@ -1696,14 +1696,25 @@ class Lake:
         folder = Path(self._spill) / "sources"
         folder.mkdir(exist_ok=True)
         catalog = (folder / f"{source.name}.duckdb").as_posix()
-        reader = "read_parquet" if source.type == "parquet" else "read_csv"
         builder = duckdb.connect(catalog)
         try:
             # The files matched now, listed one by one: the sandbox allows exactly these.
             listed = ", ".join(_quote(str(file)) for file in matched_files)
-            builder.sql(
-                f"CREATE VIEW data AS SELECT * FROM {reader}([{listed}], union_by_name = true)"
-            )
+            if source.type == "parquet":
+                reader = f"read_parquet([{listed}], union_by_name = true)"
+                replaced = _wide_decimals(builder, source.name, listed)
+            else:
+                # Detection never yields floating point: decimal text stays exact text, and the
+                # model casts it explicitly (law 11). A DECIMAL(38,9) candidate would round
+                # longer fractions silently (measured on 2.0.0).
+                # The whole file is sniffed (`sample_size = -1`): with a sample, a decimal after
+                # it would be rounded into an integer column inferred from the sample.
+                reader = (
+                    f"read_csv([{listed}], union_by_name = true, sample_size = -1, "
+                    f"auto_type_candidates = {_CSV_TYPE_CANDIDATES})"
+                )
+                replaced = ""
+            builder.sql(f"CREATE VIEW data AS SELECT *{replaced} FROM {reader}")
         except duckdb.Error as error:
             raise StoreError(
                 "STORE_SOURCE_INVALID",
@@ -3070,6 +3081,56 @@ def _utc_schema(schema: pa.Schema) -> pa.Schema:
         for field in schema
     ]
     return pa.schema(fields, metadata=schema.metadata)
+
+
+_CSV_TYPE_CANDIDATES = "['BOOLEAN', 'BIGINT', 'DATE', 'TIMESTAMP', 'TIMESTAMPTZ', 'VARCHAR']"
+
+
+def _wide_decimals(connection: duckdb.DuckDBPyConnection, source: str, listed: str) -> str:
+    """` REPLACE (…)` for every top-level Parquet column that holds, at any depth (struct
+    field, list element, map key or value), a DECIMAL wider than 38 digits in any listed file:
+    DuckDB reads such a value as DOUBLE, so reading the column fails instead (law 11). Queries
+    that do not read it are unaffected. "" when there is none.
+
+    DuckDB's own `parquet_schema` reads each file's Parquet schema from its footer (metadata,
+    no rows), the schema its reader uses: decimal annotations, converted or logical, and never
+    Arrow metadata stored in the file (#253). Nodes come in schema order (`column_id`), each
+    group followed by its `num_children` children, so every leaf maps to its top-level column.
+    """
+    result = connection.execute(
+        "SELECT list(nodes) FROM (SELECT list([name, CAST(coalesce(num_children, 0) AS VARCHAR), "
+        "CAST(coalesce(precision, 0) AS VARCHAR), CAST((converted_type = 'DECIMAL' "
+        "OR logical_type LIKE 'DecimalType(%') IS TRUE AS VARCHAR)] ORDER BY column_id) AS nodes "
+        f"FROM parquet_schema([{listed}]) GROUP BY file_name)"
+    )
+    row = result.fetchone()  # one metadata row: every file's schema nodes, in order
+    result.fetchone()  # reaches the end of the result, so the connection is free for the view
+    widest: dict[str, tuple[str, int]] = {}
+    for nodes in row[0] if row and row[0] else []:
+        remaining = [int(nodes[0][1])]  # children still to visit, per open group (root first)
+        top = ""
+        for name, children, digits, is_decimal in nodes[1:]:
+            if len(remaining) == 1:
+                top = str(name)  # a child of the root: a top-level column
+            if is_decimal == "true" and int(digits) > 38:
+                key = top.lower()
+                if int(digits) > widest.get(key, ("", 0))[1]:
+                    widest[key] = (top, int(digits))
+            remaining[-1] -= 1
+            if int(children) > 0:
+                remaining.append(int(children))
+            while remaining and remaining[-1] == 0:
+                remaining.pop()
+    if not widest:
+        return ""
+    parts = []
+    for name, digits in sorted(widest.values()):
+        message = (
+            f"UNSUPPORTED_SOURCE_TYPE: column {name} of source {source} holds a DECIMAL with "
+            f"{digits} digits, which cannot be read exactly."
+        )
+        parts.append(f"error({_quote(message)}) AS {_identifier(name)}")
+    return f" REPLACE ({', '.join(parts)})"
 
 
 class Inexact(NamedTuple):

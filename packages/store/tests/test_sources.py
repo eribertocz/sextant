@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import decimal
 import hashlib
 import subprocess
 import sys
@@ -9,6 +10,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from orvex.contracts.store.v1 import (
     FileSourceAttachment,
@@ -345,5 +348,186 @@ def test_braces_spaces_and_accents_stay_readable(
         write(lake, "CREATE TABLE fine_rows AS SELECT a FROM fine.data")
         rows = read(lake, "SELECT a FROM fine_rows ORDER BY a")
         assert rows == [{"a": 0}, {"a": 1}]
+    finally:
+        lake.close()
+
+
+def test_csv_decimals_arrive_as_exact_text(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #252: detection never yields floating point; 0.1 + 0.2 stays 0.30 after an explicit cast.
+    folder = tmp_path_factory.mktemp("csv-exact")
+    (folder / "amounts.csv").write_text(
+        "id,amount,flag,on_day,local_at,offset_at,big\n"
+        "1,0.1,true,2026-01-01,2026-01-01 10:00:00,2026-01-01 10:00:00-04,"
+        "123456789012345678901234\n"
+        "2,0.2,false,2026-01-02,2026-01-02 11:00:00,2026-01-02 11:00:00-04,"
+        "223456789012345678901234\n",
+        encoding="utf-8",
+    )
+    lake = open_lake(location, LIMITS, [source("bills", "csv", folder / "amounts.csv")])
+    try:
+        write(
+            lake,
+            "CREATE TABLE kinds AS SELECT typeof(id) AS id, typeof(amount) AS amount, "
+            "typeof(flag) AS flag, typeof(on_day) AS on_day, typeof(local_at) AS local_at, "
+            "typeof(offset_at) AS offset_at, typeof(big) AS big FROM bills.data LIMIT 1",
+        )
+        write(
+            lake,
+            "CREATE TABLE total AS "
+            "SELECT CAST(sum(CAST(amount AS DECIMAL(10, 2))) AS VARCHAR) AS amount FROM bills.data",
+        )
+        assert read(lake, "SELECT * FROM kinds") == [
+            {
+                "id": "BIGINT",
+                "amount": "VARCHAR",
+                "flag": "BOOLEAN",
+                "on_day": "DATE",
+                "local_at": "TIMESTAMP",
+                "offset_at": "TIMESTAMP WITH TIME ZONE",
+                "big": "VARCHAR",
+            }
+        ]
+        assert read(lake, "SELECT amount FROM total") == [{"amount": "0.30"}]
+    finally:
+        lake.close()
+
+
+def test_a_parquet_decimal_wider_than_38_digits_is_refused_not_rounded(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #252: DuckDB reads DECIMAL(50, 2) as DOUBLE; reading that column fails instead.
+    folder = tmp_path_factory.mktemp("wide")
+    pq.write_table(
+        pa.table(
+            {
+                "wide": pa.array(
+                    [decimal.Decimal("123456789012345678901234567890123456789012.10")],
+                    pa.decimal256(50, 2),
+                ),
+                "fine": pa.array([decimal.Decimal("1.10")], pa.decimal128(10, 2)),
+            }
+        ),
+        folder / "w.parquet",
+    )
+    lake = open_lake(location, LIMITS, [source("ledger", "parquet", folder / "w.parquet")])
+    try:
+        write(
+            lake, "CREATE TABLE fine_only AS SELECT CAST(fine AS VARCHAR) AS fine FROM ledger.data"
+        )
+        assert read(lake, "SELECT fine FROM fine_only") == [{"fine": "1.10"}]
+        with pytest.raises(StoreError) as caught:
+            write(lake, "CREATE TABLE wide_copy AS SELECT wide FROM ledger.data")
+        text = f"{caught.value} {caught.value.details}"
+        assert "UNSUPPORTED_SOURCE_TYPE" in text
+        assert "wide" in text
+        assert "ledger" in text
+    finally:
+        lake.close()
+
+
+def test_a_csv_decimal_after_the_detection_sample_stays_exact_text(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #253 Reviewer pass 1: with a sample, a later 1.5 was rounded into an integer column.
+    folder = tmp_path_factory.mktemp("csv-late")
+    lines = ["id,amount", *(f"{i},{i}" for i in range(30000)), "30000,1.5", "30001,1e3"]
+    (folder / "late.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    lake = open_lake(location, LIMITS, [source("late", "csv", folder / "late.csv")])
+    try:
+        write(
+            lake,
+            "CREATE TABLE tail AS SELECT id, typeof(amount) AS kind, amount "
+            "FROM late.data WHERE id >= 30000",
+        )
+        assert read(lake, "SELECT kind, amount FROM tail ORDER BY id") == [
+            {"kind": "VARCHAR", "amount": "1.5"},
+            {"kind": "VARCHAR", "amount": "1e3"},
+        ]
+    finally:
+        lake.close()
+
+
+def test_wide_decimals_nested_or_in_several_files_refuse_only_their_column(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #253 Reviewer pass 1: a wide decimal inside a struct, a list or a map, and one whose
+    # precision differs between files, fail when read; the other columns stay readable.
+    folder = tmp_path_factory.mktemp("wide-nested")
+    one = decimal.Decimal("1.10")
+    pq.write_table(
+        pa.table(
+            {
+                "amount": pa.array([one], pa.decimal128(10, 2)),
+                "nested": pa.array(
+                    [{"amount": one}], pa.struct([("amount", pa.decimal256(50, 2))])
+                ),
+                "listed": pa.array([[one]], pa.list_(pa.decimal256(50, 2))),
+                "mapped": pa.array([[("a", one)]], pa.map_(pa.string(), pa.decimal256(45, 2))),
+                "w": pa.array([one], pa.decimal256(45, 2)),
+                "edge": pa.array([decimal.Decimal("1.10")], pa.decimal128(38, 2)),
+            }
+        ),
+        folder / "a.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "amount": pa.array([one], pa.decimal128(10, 2)),
+                "w": pa.array([one], pa.decimal256(50, 2)),
+            }
+        ),
+        folder / "b.parquet",
+    )
+    lake = open_lake(location, LIMITS, [source("deep", "parquet", folder / "*.parquet")])
+    try:
+        write(
+            lake,
+            "CREATE TABLE fine AS SELECT CAST(amount AS VARCHAR) AS amount, "
+            "typeof(edge) AS edge_kind FROM deep.data",
+        )
+        assert read(lake, "SELECT amount, edge_kind FROM fine") == [
+            {"amount": "1.10", "edge_kind": "DECIMAL(38,2)"},
+            {"amount": "1.10", "edge_kind": "DECIMAL(38,2)"},
+        ]
+        for column in ("nested", "listed", "mapped", "w"):
+            with pytest.raises(StoreError) as caught:
+                write(lake, f"CREATE TABLE copy_{column} AS SELECT {column} FROM deep.data")
+            text = f"{caught.value} {caught.value.details}"
+            assert "UNSUPPORTED_SOURCE_TYPE" in text
+            assert f"column {column} " in text
+    finally:
+        lake.close()
+
+
+def test_a_wide_decimal_behind_arrow_metadata_is_still_refused(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #253 Reviewer pass 2: an Arrow extension or dictionary type stored in the file's
+    # metadata must not hide a DECIMAL(50, 2) that DuckDB reads as DOUBLE.
+    folder = tmp_path_factory.mktemp("wide-ext")
+    one = decimal.Decimal("1.10")
+    wide = pa.array([one], pa.decimal256(50, 2))
+    pq.write_table(
+        pa.table(
+            {
+                "opaque": pa.ExtensionArray.from_storage(pa.opaque(wide.type, "x", "y"), wide),
+                "coded": wide.dictionary_encode(),
+                "k": [1],
+            }
+        ),
+        folder / "e.parquet",
+    )
+    lake = open_lake(location, LIMITS, [source("ext", "parquet", folder / "e.parquet")])
+    try:
+        write(lake, "CREATE TABLE keys AS SELECT k FROM ext.data")
+        assert read(lake, "SELECT k FROM keys") == [{"k": 1}]
+        for column in ("opaque", "coded"):
+            with pytest.raises(StoreError) as caught:
+                write(lake, f"CREATE TABLE copy_{column} AS SELECT {column} FROM ext.data")
+            text = f"{caught.value} {caught.value.details}"
+            assert "UNSUPPORTED_SOURCE_TYPE" in text
+            assert f"column {column} " in text
     finally:
         lake.close()
