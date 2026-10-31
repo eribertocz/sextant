@@ -36,7 +36,6 @@ from typing import Any, NamedTuple
 
 import duckdb
 import pyarrow as pa
-import pyarrow.parquet as pq
 from orvex.contracts.store.v1 import (
     AzureStorage,
     CommitResult,
@@ -1703,7 +1702,7 @@ class Lake:
             listed = ", ".join(_quote(str(file)) for file in matched_files)
             if source.type == "parquet":
                 reader = f"read_parquet([{listed}], union_by_name = true)"
-                replaced = _wide_decimals(source.name, [str(file) for file in matched_files])
+                replaced = _wide_decimals(builder, source.name, listed)
             else:
                 # Detection never yields floating point: decimal text stays exact text, and the
                 # model casts it explicitly (law 11). A DECIMAL(38,9) candidate would round
@@ -3087,41 +3086,41 @@ def _utc_schema(schema: pa.Schema) -> pa.Schema:
 _CSV_TYPE_CANDIDATES = "['BOOLEAN', 'BIGINT', 'DATE', 'TIMESTAMP', 'TIMESTAMPTZ', 'VARCHAR']"
 
 
-def _wide_decimals(source: str, files: Sequence[str]) -> str:
+def _wide_decimals(connection: duckdb.DuckDBPyConnection, source: str, listed: str) -> str:
     """` REPLACE (…)` for every top-level Parquet column that holds, at any depth (struct
-    field, list element, map key or value), a DECIMAL wider than 38 digits in any of `files`:
+    field, list element, map key or value), a DECIMAL wider than 38 digits in any listed file:
     DuckDB reads such a value as DOUBLE, so reading the column fails instead (law 11). Queries
     that do not read it are unaffected. "" when there is none.
 
-    Each file's own Parquet schema is read from its footer (metadata only, no rows): every leaf
-    column with a decimal annotation, converted or logical. Arrow metadata stored in the file
-    (extension or dictionary types) is not consulted, as DuckDB ignores it too (#253)."""
+    DuckDB's own `parquet_schema` reads each file's Parquet schema from its footer (metadata,
+    no rows), the schema its reader uses: decimal annotations, converted or logical, and never
+    Arrow metadata stored in the file (#253). Nodes come in schema order (`column_id`), each
+    group followed by its `num_children` children, so every leaf maps to its top-level column.
+    """
+    result = connection.execute(
+        "SELECT list(nodes) FROM (SELECT list([name, CAST(coalesce(num_children, 0) AS VARCHAR), "
+        "CAST(coalesce(precision, 0) AS VARCHAR), CAST((converted_type = 'DECIMAL' "
+        "OR logical_type LIKE 'DecimalType(%') IS TRUE AS VARCHAR)] ORDER BY column_id) AS nodes "
+        f"FROM parquet_schema([{listed}]) GROUP BY file_name)"
+    )
+    row = result.fetchone()  # one metadata row: every file's schema nodes, in order
+    result.fetchone()  # reaches the end of the result, so the connection is free for the view
     widest: dict[str, tuple[str, int]] = {}
-    for file in files:
-        try:
-            parquet = pq.ParquetFile(file)
-            schema = parquet.schema
-            # Top-level names, longest first: a leaf path is `top.child…`, and a name may
-            # itself contain a dot.
-            tops = sorted(parquet.schema_arrow.names, key=len, reverse=True)
-            leaves = [schema.column(index) for index in range(len(schema))]
-        except (OSError, pa.ArrowException) as error:
-            raise StoreError(
-                "STORE_SOURCE_INVALID",
-                f"Source {source} cannot be read as parquet.",
-                {"source": source, "file": file, "reason": str(error)},
-            ) from None
-        for leaf in leaves:
-            annotated = leaf.converted_type == "DECIMAL" or (
-                leaf.logical_type is not None and leaf.logical_type.type == "DECIMAL"
-            )
-            if not annotated or leaf.precision <= 38:
-                continue
-            path = str(leaf.path)
-            name = next((top for top in tops if path == top or path.startswith(f"{top}.")), path)
-            key = name.lower()
-            if leaf.precision > widest.get(key, ("", 0))[1]:
-                widest[key] = (name, int(leaf.precision))
+    for nodes in row[0] if row and row[0] else []:
+        remaining = [int(nodes[0][1])]  # children still to visit, per open group (root first)
+        top = ""
+        for name, children, digits, is_decimal in nodes[1:]:
+            if len(remaining) == 1:
+                top = str(name)  # a child of the root: a top-level column
+            if is_decimal == "true" and int(digits) > 38:
+                key = top.lower()
+                if int(digits) > widest.get(key, ("", 0))[1]:
+                    widest[key] = (top, int(digits))
+            remaining[-1] -= 1
+            if int(children) > 0:
+                remaining.append(int(children))
+            while remaining and remaining[-1] == 0:
+                remaining.pop()
     if not widest:
         return ""
     parts = []
