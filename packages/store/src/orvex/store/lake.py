@@ -3093,23 +3093,35 @@ def _wide_decimals(source: str, files: Sequence[str]) -> str:
     DuckDB reads such a value as DOUBLE, so reading the column fails instead (law 11). Queries
     that do not read it are unaffected. "" when there is none.
 
-    The schemas are read with pyarrow from each file's footer (metadata only, no rows). It
-    resolves both Parquet's converted and logical decimal annotations."""
+    Each file's own Parquet schema is read from its footer (metadata only, no rows): every leaf
+    column with a decimal annotation, converted or logical. Arrow metadata stored in the file
+    (extension or dictionary types) is not consulted, as DuckDB ignores it too (#253)."""
     widest: dict[str, tuple[str, int]] = {}
     for file in files:
         try:
-            schema = pq.read_schema(file)
+            parquet = pq.ParquetFile(file)
+            schema = parquet.schema
+            # Top-level names, longest first: a leaf path is `top.child…`, and a name may
+            # itself contain a dot.
+            tops = sorted(parquet.schema_arrow.names, key=len, reverse=True)
+            leaves = [schema.column(index) for index in range(len(schema))]
         except (OSError, pa.ArrowException) as error:
             raise StoreError(
                 "STORE_SOURCE_INVALID",
                 f"Source {source} cannot be read as parquet.",
-                {"source": source, "file": file, "duckdb": str(error)},
+                {"source": source, "file": file, "reason": str(error)},
             ) from None
-        for field in schema:
-            digits = _widest_decimal(field.type)
-            key = field.name.lower()
-            if digits > 38 and digits > widest.get(key, ("", 0))[1]:
-                widest[key] = (field.name, digits)
+        for leaf in leaves:
+            annotated = leaf.converted_type == "DECIMAL" or (
+                leaf.logical_type is not None and leaf.logical_type.type == "DECIMAL"
+            )
+            if not annotated or leaf.precision <= 38:
+                continue
+            path = str(leaf.path)
+            name = next((top for top in tops if path == top or path.startswith(f"{top}.")), path)
+            key = name.lower()
+            if leaf.precision > widest.get(key, ("", 0))[1]:
+                widest[key] = (name, int(leaf.precision))
     if not widest:
         return ""
     parts = []
@@ -3120,25 +3132,6 @@ def _wide_decimals(source: str, files: Sequence[str]) -> str:
         )
         parts.append(f"error({_quote(message)}) AS {_identifier(name)}")
     return f" REPLACE ({', '.join(parts)})"
-
-
-def _widest_decimal(kind: pa.DataType) -> int:
-    """The largest DECIMAL precision anywhere inside an Arrow type (0 when there is none)."""
-    if pa.types.is_decimal(kind):
-        return int(kind.precision)
-    if pa.types.is_struct(kind):
-        return max((_widest_decimal(kind.field(i).type) for i in range(kind.num_fields)), default=0)
-    if pa.types.is_map(kind):
-        return max(_widest_decimal(kind.key_type), _widest_decimal(kind.item_type))
-    if (
-        pa.types.is_list(kind)
-        or pa.types.is_large_list(kind)
-        or pa.types.is_fixed_size_list(kind)
-        or pa.types.is_list_view(kind)
-        or pa.types.is_large_list_view(kind)
-    ):
-        return _widest_decimal(kind.value_type)
-    return 0
 
 
 class Inexact(NamedTuple):

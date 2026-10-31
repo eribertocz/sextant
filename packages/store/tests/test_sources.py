@@ -499,3 +499,35 @@ def test_wide_decimals_nested_or_in_several_files_refuse_only_their_column(
             assert f"column {column} " in text
     finally:
         lake.close()
+
+
+def test_a_wide_decimal_behind_arrow_metadata_is_still_refused(
+    location: Location, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # #253 Reviewer pass 2: an Arrow extension or dictionary type stored in the file's
+    # metadata must not hide a DECIMAL(50, 2) that DuckDB reads as DOUBLE.
+    folder = tmp_path_factory.mktemp("wide-ext")
+    one = decimal.Decimal("1.10")
+    wide = pa.array([one], pa.decimal256(50, 2))
+    pq.write_table(
+        pa.table(
+            {
+                "opaque": pa.ExtensionArray.from_storage(pa.opaque(wide.type, "x", "y"), wide),
+                "coded": wide.dictionary_encode(),
+                "k": [1],
+            }
+        ),
+        folder / "e.parquet",
+    )
+    lake = open_lake(location, LIMITS, [source("ext", "parquet", folder / "e.parquet")])
+    try:
+        write(lake, "CREATE TABLE keys AS SELECT k FROM ext.data")
+        assert read(lake, "SELECT k FROM keys") == [{"k": 1}]
+        for column in ("opaque", "coded"):
+            with pytest.raises(StoreError) as caught:
+                write(lake, f"CREATE TABLE copy_{column} AS SELECT {column} FROM ext.data")
+            text = f"{caught.value} {caught.value.details}"
+            assert "UNSUPPORTED_SOURCE_TYPE" in text
+            assert f"column {column} " in text
+    finally:
+        lake.close()
